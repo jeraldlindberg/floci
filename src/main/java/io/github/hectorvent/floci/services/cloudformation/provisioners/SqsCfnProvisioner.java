@@ -36,7 +36,7 @@ public class SqsCfnProvisioner implements CfnResourceProvisioner {
     public void provision(StackResource r, JsonNode props, ProvisionContext ctx) {
         switch (r.getResourceType()) {
             case "AWS::SQS::Queue" -> provisionQueue(r, props, ctx);
-            case "AWS::SQS::QueuePolicy" -> provisionQueuePolicy(r);
+            case "AWS::SQS::QueuePolicy" -> provisionQueuePolicy(r, ctx);
             default -> throw new IllegalStateException("SqsCfnProvisioner cannot handle " + r.getResourceType());
         }
     }
@@ -55,12 +55,23 @@ public class SqsCfnProvisioner implements CfnResourceProvisioner {
                 : null;
         boolean fifo = "true".equalsIgnoreCase(fifoFlag);
         String queueName = ctx.resolveOptional(props, "QueueName");
+        // The physical id is the queue URL, so ctx.stablePhysicalName does not fit: the prior name
+        // comes from the QueueName attribute recorded at create time, as SnsCfnProvisioner reads
+        // the topic name beside its ARN. Keeping it means an unnamed queue survives an update
+        // instead of being orphaned with its messages. FifoQueue is createOnly like QueueName, so a
+        // prior name whose .fifo suffix no longer matches the flag is a replacing update and gets a
+        // fresh name.
+        String priorName = r.getAttributes() != null ? r.getAttributes().get("QueueName") : null;
         if (queueName == null || queueName.isBlank()) {
-            // Like real CloudFormation, generated names of FIFO queues must end in .fifo
-            // (SqsService rejects FifoQueue=true otherwise). Keep within the 80-char limit.
-            queueName = fifo
-                    ? ctx.generatePhysicalName(r.getLogicalId(), 75, false) + ".fifo"
-                    : ctx.generatePhysicalName(r.getLogicalId(), 80, false);
+            if (priorName != null && !priorName.isBlank() && priorName.endsWith(".fifo") == fifo) {
+                queueName = priorName;
+            } else {
+                // Like real CloudFormation, generated names of FIFO queues must end in .fifo
+                // (SqsService rejects FifoQueue=true otherwise). Keep within the 80-char limit.
+                queueName = fifo
+                        ? ctx.generatePhysicalName(r.getLogicalId(), 75, false) + ".fifo"
+                        : ctx.generatePhysicalName(r.getLogicalId(), 80, false);
+            }
         }
         Map<String, String> attrs = new HashMap<>();
         if (props != null) {
@@ -88,18 +99,35 @@ public class SqsCfnProvisioner implements CfnResourceProvisioner {
                 attrs.put("RedrivePolicy", ctx.engine().resolveJsonAttribute(props.path("RedrivePolicy")));
             }
         }
-        Queue queue = sqsService.createQueue(queueName, attrs, ctx.region());
+        // provision is also the update path. createQueue on a name that exists hands back the
+        // queue only when every attribute matches and answers QueueAlreadyExists otherwise, so the
+        // second UpdateStack that changes VisibilityTimeout must go through SetQueueAttributes, the
+        // registry schema's update handler, rather than a second create. The prior physical id is
+        // the queue URL SetQueueAttributes addresses. A replacing update derives a different name
+        // and still creates.
+        String queueUrl;
+        if (ctx.isUpdate() && queueName.equals(priorName)) {
+            attrs.remove("FifoQueue");
+            sqsService.setQueueAttributes(ctx.priorPhysicalId(), attrs, ctx.region());
+            queueUrl = ctx.priorPhysicalId();
+        } else {
+            Queue queue = sqsService.createQueue(queueName, attrs, ctx.region());
+            queueUrl = queue.getQueueUrl();
+        }
         // QueueArn is computed on demand in SqsService#getQueueAttributes and is not stored on the
         // Queue object, so build it here from region + accountId + queueName. Without this,
         // Fn::GetAtt [Queue, Arn] references resolve to an empty string.
         String queueArn = AwsArnUtils.Arn.of("sqs", ctx.region(), ctx.accountId(), queueName).toString();
-        r.setPhysicalId(queue.getQueueUrl());
+        r.setPhysicalId(queueUrl);
         r.getAttributes().put("Arn", queueArn);
         r.getAttributes().put("QueueName", queueName);
-        r.getAttributes().put("QueueUrl", queue.getQueueUrl());
+        r.getAttributes().put("QueueUrl", queueUrl);
     }
 
-    private void provisionQueuePolicy(StackResource r) {
-        r.setPhysicalId("queue-policy-" + UUID.randomUUID().toString().substring(0, 8));
+    private void provisionQueuePolicy(StackResource r, ProvisionContext ctx) {
+        // A policy has no backing entity, so its id only has to stay put across updates.
+        r.setPhysicalId(ctx.isUpdate()
+                ? ctx.priorPhysicalId()
+                : "queue-policy-" + UUID.randomUUID().toString().substring(0, 8));
     }
 }
